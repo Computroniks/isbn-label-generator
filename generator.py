@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 import requests
 from time import sleep
+import re
+from PIL import Image, ImageDraw, ImageFont
 
 
 def beep(count=1):
@@ -34,9 +36,6 @@ class Book:
 
 
 class Generator:
-    def __init__(self, printer_mac: str):
-        self._printer_mac = printer_mac
-
     @staticmethod
     def _query_book(isbn: str) -> Book:
         response = requests.get(
@@ -54,7 +53,8 @@ class Generator:
             and "lc_classifications" in book["classifications"].keys()
             and len(book["classifications"]["lc_classifications"]) > 0
         ):
-            ident = book["classifications"]["lc_classifications"][0]
+            ident = sorted(book["classifications"]["lc_classifications"], key=len)[-1]
+            ident = re.sub("[^0-9a-zA-Z\\.]+", " ", ident)
         else:
             ident = None
 
@@ -81,17 +81,187 @@ class Generator:
         return current_uid
 
     @staticmethod
-    def _format_ident(ident: str) -> str:
-        letters = ""
-        code = ""
-        if ident[1].isalpha():
-            letters = ident[:2]
-            code = ident[2:]
-        else:
-            letters = ident[:1]
-            code = ident[1:]
+    def _format_ident(call_number: str) -> str:
+        """
+        Format an LOC call number into lines suitable for labels.
+        - Handles optional prefixes.
+        - Accepts space between class letters and number (HD 30.22 -> HD30.22).
+        - Ensures cutters have leading dots; splits combined cutter sequences like T8E2 -> .T8, .E2.
+        - Preserves year suffixes (1983b) and v./c. tokens.
+        """
+        if not call_number or not call_number.strip():
+            return ""
 
-        return f"{letters}\n{"\n".join(code.split("."))}"
+        cn = call_number.strip()
+        cn = re.sub(r"\s+", " ", cn)
+
+        parts = []
+
+        # Common prefixes
+        prefix_match = re.match(
+            r"^(REF|JUV|OVERSIZE|MAPS|DOCS|SERIAL|MICRO|SHELF)\b", cn, re.IGNORECASE
+        )
+        if prefix_match:
+            parts.append(prefix_match.group(1).upper())
+            cn = cn[prefix_match.end() :].strip()
+
+        # Main class (letters + number, allow space)
+        main_match = re.match(r"^([A-Z]{1,3})\s*(\d+(?:\.\d+)?)", cn, re.IGNORECASE)
+        if main_match:
+            parts.append(f"{main_match.group(1).upper()}{main_match.group(2)}")
+            cn = cn[main_match.end() :].strip()
+        else:
+            # fallback: take first token
+            token = cn.split()[0] if cn else ""
+            parts.append(token.upper())
+            cn = cn[len(token) :].strip()
+
+        # Space out dots so we can detect dot tokens reliably
+        spaced = re.sub(r"\.+", " . ", cn)
+        tokens = [t for t in spaced.split() if t]
+
+        normalized = []
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+
+            # Attach '.' to next token if token is just a dot
+            if t == ".":
+                if i + 1 < len(tokens):
+                    token = "." + tokens[i + 1]
+                    i += 2
+                else:
+                    token = "."
+                    i += 1
+            else:
+                token = t
+                i += 1
+
+            # Handle v./c. token sequences (v . 2 -> v.2)
+            m_vc = re.fullmatch(r"([vc])\.(\d+)", token, re.IGNORECASE)
+            if m_vc:
+                normalized.append(f"{m_vc.group(1).lower()}.{m_vc.group(2)}")
+                continue
+
+            # If token is a year with trailing letter already, keep it
+            if re.fullmatch(r"\d{4}[A-Za-z]?", token):
+                normalized.append(token)
+                continue
+
+            # If token is a dot-prefixed chunk that may contain multiple letter+number groups,
+            # split it into separate cutters: .T8E2 -> .T8, .E2
+            if token.startswith("."):
+                core = token[1:]
+                # find letter+number groups in sequence
+                groups = re.findall(r"([A-Za-z]+)(\d+(?:\.\d+)?)", core)
+                if groups:
+                    for g in groups:
+                        normalized.append("." + g[0].upper() + g[1])
+                    continue
+                else:
+                    # if no letter+number groups, just normalize casing
+                    normalized.append("." + core)
+                    continue
+
+            # If token looks like letter+digits (no leading dot), treat as cutter and add dot
+            if re.fullmatch(r"[A-Za-z]+\d+(?:\.\d+)?", token):
+                # split multiple groups if present (e.g., T8E2 -> T8, E2)
+                groups = re.findall(r"([A-Za-z]+)(\d+(?:\.\d+)?)", token)
+                if groups:
+                    for g in groups:
+                        normalized.append("." + g[0].upper() + g[1])
+                else:
+                    normalized.append("." + token.upper())
+                continue
+
+            # Merge year + single-letter suffix if split (e.g., "1983" followed by "b")
+            if (
+                re.fullmatch(r"\d{4}", token)
+                and normalized
+                and re.fullmatch(r"[A-Za-z]", normalized[-1])
+            ):
+                normalized[-1] = normalized[-1] + token
+                continue
+
+            # default: keep token
+            normalized.append(token)
+
+        # Post-process normalized tokens: casing rules
+        out_lines = []
+        for p in normalized:
+            if re.fullmatch(r"\d{4}[A-Za-z]?", p):
+                out_lines.append(p)
+            elif re.fullmatch(r"v\.\d+|c\.\d+", p, re.IGNORECASE):
+                out_lines.append(p.lower())
+            elif p.startswith("."):
+                # make letters uppercase in cutters
+                m = re.match(r"\.([A-Za-z]+)(\d*(?:\.\d+)?)", p)
+                if m:
+                    out_lines.append(f".{m.group(1).upper()}{m.group(2)}")
+                else:
+                    out_lines.append(p)
+            else:
+                out_lines.append(p.upper())
+
+        final_lines = parts + out_lines
+        return "\n".join(final_lines)
+
+    @staticmethod
+    def _text_to_image(text):
+        """
+        Create a 306x306 px image with centered, left-aligned text.
+
+        Args:
+            text (str): Text string containing newlines
+
+        Returns:
+            PIL.Image: Image object with the rendered text
+        """
+        # Create a white image
+        img = Image.new("RGB", (306, 306), color="white")
+        draw = ImageDraw.Draw(img)
+
+        # Use monospace font for Linux
+        try:
+            font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 45
+            )
+        except:
+            font = ImageFont.load_default()
+
+        # Split text into lines
+        lines = text.split("\n")
+
+        # Calculate text dimensions for centering
+        line_heights = []
+        line_widths = []
+
+        for line in lines:
+            # Use a space to get proper height for blank lines
+            text_to_measure = line if line else " "
+            bbox = draw.textbbox((0, 0), text_to_measure, font=font)
+            line_widths.append(bbox[2] - bbox[0] if line else 0)
+            line_heights.append(bbox[3] - bbox[1])
+
+        # Calculate total text block height
+        line_spacing = 5
+        total_height = sum(line_heights) + line_spacing * (len(lines) - 1)
+
+        # Find the maximum line width for left alignment
+        max_width = max(line_widths) if line_widths else 0
+
+        # Calculate starting y position to center the text block vertically
+        y = (306 - total_height) // 2
+
+        # Calculate starting x position to center the text block horizontally
+        x = (306 - max_width) // 2
+
+        # Draw each line
+        for i, line in enumerate(lines):
+            draw.text((x, y), line, fill="black", font=font)
+            y += line_heights[i] + line_spacing
+
+        return img
 
     @staticmethod
     def prompt_confirm(msg: str, default: bool = None) -> bool:
@@ -166,27 +336,21 @@ class Generator:
         if not rapid and Generator.prompt_confirm("Is this correct?", True):
             return False
 
+        if len(book.ident.replace(" ", "")) < 6 and not Generator.prompt_confirm(
+            "Warning: Short LOC. Continue?"
+        ):
+            return False
+
         uid = Generator.store_book(book)
-        print("Printing label:")
-        print("AMH")
-        print(f"{uid:>04}")
-        print(Generator._format_ident(book.ident))
-
-
-def format_mac(mac):
-    # Ensure the input has exactly 12 hexadecimal characters
-    mac = mac.strip().replace(":", "").replace("-", "").upper()
-    if len(mac) != 12 or not all(c in "0123456789ABCDEF" for c in mac):
-        raise ValueError("Invalid MAC address format")
-
-    # Group into pairs and join with colons
-    return ":".join(mac[i : i + 2] for i in range(0, 12, 2))
+        label_text = f"AMH {uid:>04X}\n\n" + Generator._format_ident(book.ident)
+        label = Generator._text_to_image(label_text)
+        label.save("label.png")
 
 
 def main() -> None:
     print("Welcome to the ISBN label printer")
 
-    generator = Generator(format_mac(input("Enter label printer MAC: ")))
+    generator = Generator()
 
     rapid = Generator.prompt_confirm("Prompt for manual mode on failure?", True)
 
