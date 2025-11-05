@@ -4,6 +4,10 @@ from time import sleep
 import re
 from PIL import Image, ImageDraw, ImageFont
 
+from brother_ql.raster import BrotherQLRaster
+from brother_ql.backends.helpers import send
+from brother_ql.conversion import convert
+
 
 def beep(count=1):
     for i in range(count):
@@ -12,30 +16,68 @@ def beep(count=1):
             sleep(0.25)
 
 
+def has_valid_year_at_end(text: str):
+    """
+    Check if the last 4 characters of a string are digits representing a valid year.
+
+    Args:
+        text (str): The string to check
+
+    Returns:
+        bool: True if last 4 chars are a valid year, False otherwise
+    """
+    # Check if string has at least 4 characters
+    if len(text) < 4:
+        return False
+
+    if text[-1].isalpha():
+        text = text[:-1]
+
+    # Extract last 4 characters
+    last_four = text[-4:]
+
+    # Check if they are all digits
+    if not last_four.isdigit():
+        return False
+
+    # Convert to integer and check if it's a reasonable year range
+    year = int(last_four)
+
+    # Check if year is in a reasonable range (e.g., 1000-2999)
+    # Adjust this range based on your specific needs
+    return 1000 <= year <= 2999
+
+
 @dataclass
 class Book:
     isbn: str | None
     ident: str | None
     title: str | None
     authors: str | None
+    year: str | None
 
     def __str__(self) -> str:
-        return f"\nTitle: {self.title}\nISBN: {self.isbn}\nAuthors: {self.authors}\nLOC: {self.ident}\n"
+        return f"\nTitle: {self.title}\nISBN: {self.isbn}\nAuthors: {self.authors}\nLOC: {self.ident}\nYear: {self.year}\n"
 
     @staticmethod
     def from_book(book: "Book") -> "Book":
         if book is None:
-            return Book(None, None, None, None)
+            return Book(None, None, None, None, None)
 
         return Book(
             isbn=book.isbn,
             ident=book.ident if book.ident != "" else None,
             title=book.title,
             authors=book.authors,
+            year=book.year,
         )
 
 
 class Generator:
+    def __init__(self, model: str, printer: str):
+        self._model = model
+        self._printer = printer
+
     @staticmethod
     def _query_book(isbn: str) -> Book:
         response = requests.get(
@@ -58,11 +100,16 @@ class Generator:
         else:
             ident = None
 
+        year = None
+        if "publish_date" in book.keys():
+            year = book["publish_date"]
+
         return Book(
             isbn=isbn,
             ident=ident,
             title=book["title"],
             authors=" and ".join(map(lambda x: x["name"], book["authors"])),
+            year=year,
         )
 
     @staticmethod
@@ -301,6 +348,14 @@ class Generator:
 
         print(book)
 
+    def print(self, image: Image) -> None:
+        instructions = convert(BrotherQLRaster(self._model), [image], label="29")
+        send(
+            instructions=instructions,
+            printer_identifier=self._printer,
+            backend_identifier="linux_kernel",
+        )
+
     def prompt_book(self, rapid: bool = False) -> bool:
         """
         prompt_book Prompt the user for a book
@@ -341,16 +396,20 @@ class Generator:
         ):
             return False
 
+        if not has_valid_year_at_end(book.ident) and book.year is not None:
+            book.ident += " " + book.year[-4:]
+
         uid = Generator.store_book(book)
         label_text = f"AMH {uid:>04X}\n\n" + Generator._format_ident(book.ident)
         label = Generator._text_to_image(label_text)
         label.save("label.png")
+        self.print(label)
 
 
 def main() -> None:
     print("Welcome to the ISBN label printer")
 
-    generator = Generator()
+    generator = Generator("QL-570", "file:///dev/usb/lp0")
 
     rapid = Generator.prompt_confirm("Prompt for manual mode on failure?", True)
 
